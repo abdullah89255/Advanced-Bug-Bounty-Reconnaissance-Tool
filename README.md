@@ -1,4 +1,4 @@
-# Advanced-Bug-Bounty-Reconnaissance-Tool
+
 # 🔍 Advanced Bug Bounty Reconnaissance Tool
 
 > ⚠️ **LEGAL NOTICE**: This tool is for **authorized security testing only**.
