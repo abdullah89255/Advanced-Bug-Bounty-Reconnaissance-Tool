@@ -60,28 +60,68 @@ except ImportError:
     REQUESTS_OK = False
     warn("requests not installed. Run: pip3 install requests")
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.5',
-}
+# Rotate User-Agents to avoid simple bot detection
+_USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+]
+_ua_counter = [0]
 
-def safe_get(url, timeout=10, allow_redirects=True, headers=None, **kwargs):
+def _next_ua():
+    ua = _USER_AGENTS[_ua_counter[0] % len(_USER_AGENTS)]
+    _ua_counter[0] += 1
+    return ua
+
+BASE_HEADERS = {
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Accept-Encoding': 'gzip, deflate',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+}
+# Keep HEADERS alias so rest of code using HEADERS still works
+HEADERS = BASE_HEADERS
+
+def safe_get(url, timeout=10, allow_redirects=True, headers=None, retries=2, **kwargs):
     if not REQUESTS_OK:
         return None
-    try:
-        h = {**HEADERS, **(headers or {})}
-        r = requests.get(url, headers=h, timeout=timeout,
-                         verify=False, allow_redirects=allow_redirects, **kwargs)
-        return r
-    except Exception:
-        return None
+    h = {**BASE_HEADERS, 'User-Agent': _next_ua(), **(headers or {})}
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(url, headers=h, timeout=timeout,
+                             verify=False, allow_redirects=allow_redirects, **kwargs)
+            return r
+        except requests.exceptions.SSLError:
+            # SSL failure — try plain HTTP once
+            if url.startswith('https://') and attempt == 0:
+                try:
+                    r = requests.get(url.replace('https://', 'http://'), headers=h,
+                                     timeout=timeout, verify=False,
+                                     allow_redirects=allow_redirects, **kwargs)
+                    return r
+                except Exception as e:
+                    last_exc = e
+        except requests.exceptions.ConnectionError as e:
+            last_exc = e
+            if attempt < retries:
+                time.sleep(0.4 * (attempt + 1))
+        except requests.exceptions.Timeout as e:
+            last_exc = e
+            timeout = timeout + 5  # widen on retry
+        except Exception as e:
+            last_exc = e
+            break
+    return None
 
 def safe_post(url, data=None, json_data=None, timeout=10, headers=None, **kwargs):
     if not REQUESTS_OK:
         return None
     try:
-        h = {**HEADERS, **(headers or {})}
+        h = {**BASE_HEADERS, 'User-Agent': _next_ua(), **(headers or {})}
         r = requests.post(url, data=data, json=json_data, headers=h,
                           timeout=timeout, verify=False, **kwargs)
         return r
@@ -541,73 +581,308 @@ class CMSDetector:
 # 6. URL & ENDPOINT GATHERING
 # ══════════════════════════════════════════════════════════════
 class URLGatherer:
+    # Common paths to always probe regardless of spider results
+    COMMON_PATHS = [
+        '/admin', '/api', '/api/v1', '/api/v2', '/login', '/logout',
+        '/register', '/signup', '/dashboard', '/profile', '/settings',
+        '/upload', '/uploads', '/files', '/images', '/static',
+        '/search', '/contact', '/about', '/help', '/docs',
+        '/robots.txt', '/sitemap.xml', '/sitemap_index.xml',
+        '/.well-known/security.txt', '/security.txt',
+        '/health', '/status', '/ping', '/version', '/info',
+        '/api/users', '/api/user', '/api/me', '/api/auth',
+        '/api/login', '/api/register', '/api/products', '/api/orders',
+        '/graphql', '/gql', '/rest', '/ws', '/websocket',
+        '/swagger.json', '/openapi.json', '/api-docs',
+        '/config', '/configuration', '/debug', '/test',
+        '/backup', '/old', '/new', '/v1', '/v2',
+        '/assets', '/dist', '/build', '/public',
+        '/js', '/css', '/img', '/fonts',
+    ]
+
     def __init__(self, domain, results):
         self.domain  = domain
         self.results = results
         self.visited = set()
         self.urls    = set()
+        # Try HTTPS first, fall back to HTTP
+        self.base_https = f"https://{self.domain}"
+        self.base_http  = f"http://{self.domain}"
+        self.base       = self.base_https  # updated after connectivity check
 
     def run(self):
         section("URL & ENDPOINT GATHERING")
-        base = f"https://{self.domain}"
 
-        # Wayback Machine
-        info("Fetching Wayback Machine URLs...")
-        self._wayback(self.domain)
+        # ── Connectivity check: prefer HTTPS, fall back to HTTP ──
+        info("Checking connectivity...")
+        r = safe_get(self.base_https, timeout=10)
+        if r is None:
+            warn("HTTPS failed, trying HTTP...")
+            r = safe_get(self.base_http, timeout=10)
+            if r:
+                self.base = self.base_http
+                success(f"  Connected via HTTP ({self.base})")
+            else:
+                error("Target unreachable on both HTTP and HTTPS")
+                return []
+        else:
+            success(f"  Connected via HTTPS ({self.base})")
 
-        # Spider first page
-        info("Spidering target...")
-        self._spider(base, depth=2)
+        # ── Source 1: Wayback Machine ────────────────────────────
+        info("Fetching Wayback Machine (web.archive.org)...")
+        wb_count = self._wayback()
+        success(f"  Wayback Machine: {wb_count} URLs fetched")
 
-        # Interesting parameter URLs
-        param_urls = [u for u in self.urls if '?' in u]
-        success(f"  URLs with parameters: {len(param_urls)}")
-        success(f"  Total URLs gathered: {len(self.urls)}")
+        # ── Source 2: CommonCrawl index ──────────────────────────
+        info("Fetching CommonCrawl index...")
+        cc_count = self._commoncrawl()
+        success(f"  CommonCrawl: {cc_count} URLs fetched")
 
-        self.results.urls = list(self.urls)[:500]
-        return list(self.urls)
+        # ── Source 3: AlienVault OTX ─────────────────────────────
+        info("Fetching AlienVault OTX passive URLs...")
+        otx_count = self._alienvault_otx()
+        success(f"  AlienVault OTX: {otx_count} URLs fetched")
 
-    def _wayback(self, domain):
+        # ── Source 4: Active spidering ───────────────────────────
+        info("Active spidering (depth=3)...")
+        self._spider(self.base, depth=3)
+        success(f"  Spider visited: {len(self.visited)} pages")
+
+        # ── Source 5: Forced path discovery ──────────────────────
+        info("Probing common paths...")
+        found_paths = self._probe_common_paths()
+        success(f"  Common paths found: {found_paths}")
+
+        # ── Source 6: Extract from robots.txt / sitemap ──────────
+        info("Parsing robots.txt and sitemap...")
+        self._parse_robots()
+        self._parse_sitemap(self.base + '/sitemap.xml')
+        self._parse_sitemap(self.base + '/sitemap_index.xml')
+
+        # ── Summary ──────────────────────────────────────────────
+        all_urls  = list(self.urls)
+        param_urls = [u for u in all_urls if '?' in u]
+        api_urls   = [u for u in all_urls if '/api/' in u.lower()]
+        js_urls    = [u for u in all_urls if u.endswith('.js')]
+
+        print()
+        success(f"  Total unique URLs  : {C.BOLD}{len(all_urls)}{C.RESET}")
+        success(f"  With parameters    : {len(param_urls)}")
+        success(f"  API endpoints      : {len(api_urls)}")
+        success(f"  JavaScript files   : {len(js_urls)}")
+
+        self.results.urls = all_urls[:1000]
+        return all_urls
+
+    # ── Wayback Machine ──────────────────────────────────────────
+    def _wayback(self):
+        added = 0
+        # Two queries: exact domain + all subdomains
+        queries = [
+            f"https://web.archive.org/cdx/search/cdx?url={self.domain}/*&output=json&fl=original&collapse=urlkey&limit=1000&filter=statuscode:200",
+            f"https://web.archive.org/cdx/search/cdx?url=*.{self.domain}/*&output=json&fl=original&collapse=urlkey&limit=500",
+        ]
+        for api_url in queries:
+            try:
+                r = safe_get(api_url, timeout=30)
+                if not r:
+                    warn("  Wayback: no response")
+                    continue
+                if r.status_code != 200:
+                    warn(f"  Wayback: HTTP {r.status_code}")
+                    continue
+                text = r.text.strip()
+                if not text or text == '[]':
+                    warn("  Wayback: empty response")
+                    continue
+                try:
+                    data = r.json()
+                except Exception as e:
+                    warn(f"  Wayback: JSON parse error – {e}")
+                    continue
+                # First row is the header ["original"], skip it
+                rows = data[1:] if (data and isinstance(data[0], list) and data[0][0] == 'original') else data
+                for row in rows:
+                    if isinstance(row, list) and row:
+                        url = row[0]
+                    elif isinstance(row, str):
+                        url = row
+                    else:
+                        continue
+                    if url and url.startswith('http') and self.domain in url:
+                        if url not in self.urls:
+                            self.urls.add(url)
+                            added += 1
+            except Exception as e:
+                warn(f"  Wayback error: {e}")
+        return added
+
+    # ── CommonCrawl ──────────────────────────────────────────────
+    def _commoncrawl(self):
+        added = 0
         try:
-            r = safe_get(
-                f"https://web.archive.org/cdx/search/cdx?url=*.{domain}/*&output=json&fl=original&collapse=urlkey&limit=500",
-                timeout=20
-            )
+            api = f"http://index.commoncrawl.org/CC-MAIN-2024-10-index?url=*.{self.domain}&output=json&limit=300"
+            r = safe_get(api, timeout=20)
             if r and r.status_code == 200:
-                for row in r.json()[1:]:
-                    url = row[0]
-                    self.urls.add(url)
-                    self.results.urls.append(url)
-                success(f"  Wayback: {len(self.urls)} historical URLs")
-        except Exception:
-            pass
+                for line in r.text.splitlines():
+                    try:
+                        obj = json.loads(line)
+                        url = obj.get('url', '')
+                        if url and self.domain in url:
+                            self.urls.add(url)
+                            added += 1
+                    except Exception:
+                        pass
+        except Exception as e:
+            warn(f"  CommonCrawl error: {e}")
+        return added
 
-    def _spider(self, url, depth=2):
-        if depth == 0 or url in self.visited or len(self.visited) > 150:
+    # ── AlienVault OTX ───────────────────────────────────────────
+    def _alienvault_otx(self):
+        added = 0
+        try:
+            api = f"https://otx.alienvault.com/api/v1/indicators/domain/{self.domain}/url_list?limit=500&page=1"
+            r = safe_get(api, timeout=15)
+            if r and r.status_code == 200:
+                data = r.json()
+                for entry in data.get('url_list', []):
+                    url = entry.get('url', '')
+                    if url and self.domain in url:
+                        self.urls.add(url)
+                        added += 1
+        except Exception as e:
+            warn(f"  OTX error: {e}")
+        return added
+
+    # ── Active Spider ─────────────────────────────────────────────
+    def _spider(self, url, depth=3):
+        if depth == 0 or url in self.visited or len(self.visited) > 300:
+            return
+        # Normalise URL (strip fragment)
+        url = url.split('#')[0].rstrip('/')
+        if not url:
             return
         self.visited.add(url)
 
-        r = safe_get(url, timeout=8)
+        r = safe_get(url, timeout=10)
         if not r:
             return
 
-        # Extract all links
-        links = re.findall(r'href=["\']([^"\']+)["\']', r.text)
-        srcs  = re.findall(r'src=["\']([^"\']+)["\']', r.text)
-        actions = re.findall(r'action=["\']([^"\']+)["\']', r.text)
+        self.urls.add(url)
+        content_type = r.headers.get('content-type', '')
 
-        for link in links + srcs + actions:
-            if link.startswith('http'):
+        # Only parse HTML pages
+        if 'html' not in content_type and 'javascript' not in content_type:
+            return
+
+        body = r.text
+
+        # Extract every kind of URL reference
+        patterns = [
+            r'href=["\']([^"\'#\s]{2,})["\']',
+            r'src=["\']([^"\'#\s]{2,})["\']',
+            r'action=["\']([^"\'#\s]{2,})["\']',
+            r'data-url=["\']([^"\'#\s]{2,})["\']',
+            r'data-href=["\']([^"\'#\s]{2,})["\']',
+            r'content=["\'][^"\']*https?://([^"\'#\s]{5,})["\']',
+            # JS fetch/axios/XHR calls
+            r'fetch\(["\']([^"\']{4,})["\']',
+            r'axios\.[a-z]+\(["\']([^"\']{4,})["\']',
+            r'\.get\(["\']([/][^"\']{3,})["\']',
+            r'\.post\(["\']([/][^"\']{3,})["\']',
+            r'url:\s*["\']([^"\']{4,})["\']',
+            r'endpoint:\s*["\']([^"\']{4,})["\']',
+            r'path:\s*["\']([/][^"\']{3,})["\']',
+            r'"([/][a-zA-Z0-9_\-/]{3,}\?[^"\s]{3,})"',  # "/path?param=val"
+        ]
+
+        new_links = []
+        for pat in patterns:
+            new_links += re.findall(pat, body)
+
+        for link in new_links:
+            link = link.strip()
+            if not link or link.startswith('mailto:') or link.startswith('tel:'):
+                continue
+            # Resolve to absolute URL
+            if link.startswith('http://') or link.startswith('https://'):
                 full = link
+            elif link.startswith('//'):
+                full = 'https:' + link
             elif link.startswith('/'):
-                full = f"https://{self.domain}{link}"
+                parsed_base = urlparse(self.base)
+                full = f"{parsed_base.scheme}://{parsed_base.netloc}{link}"
             else:
+                # Relative path — resolve against current URL
+                full = urljoin(url, link)
+
+            full = full.split('#')[0]
+            if not full.startswith('http'):
+                continue
+            if self.domain not in full:
                 continue
 
-            if self.domain in full:
-                self.urls.add(full)
-                if depth > 1 and '?' not in full:
-                    self._spider(full, depth - 1)
+            self.urls.add(full)
+            # Recurse into same-domain HTML pages (not assets)
+            ext = full.split('?')[0].rsplit('.', 1)[-1].lower() if '.' in full.split('?')[0] else ''
+            if depth > 1 and full not in self.visited and ext not in {
+                'jpg','jpeg','png','gif','svg','ico','css','woff','woff2',
+                'ttf','eot','pdf','zip','gz','mp4','mp3','avi','mov'
+            }:
+                self._spider(full, depth - 1)
+
+    # ── Forced Path Probe ─────────────────────────────────────────
+    def _probe_common_paths(self):
+        found = 0
+        def probe(path):
+            url = self.base + path
+            r = safe_get(url, allow_redirects=True, timeout=6)
+            if r and r.status_code not in [404, 410, 444]:
+                self.urls.add(url)
+                return True
+            return False
+
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            futs = {ex.submit(probe, p): p for p in self.COMMON_PATHS}
+            for fut in as_completed(futs):
+                if fut.result():
+                    found += 1
+                    success(f"  Found: {self.base}{futs[fut]}  [{C.GREEN}live{C.RESET}]")
+        return found
+
+    # ── robots.txt parser ─────────────────────────────────────────
+    def _parse_robots(self):
+        r = safe_get(f"{self.base}/robots.txt", timeout=8)
+        if not r or r.status_code != 200:
+            return
+        for line in r.text.splitlines():
+            line = line.strip()
+            if line.lower().startswith(('disallow:', 'allow:', 'sitemap:')):
+                parts = line.split(':', 1)
+                if len(parts) == 2:
+                    val = parts[1].strip()
+                    if val.startswith('/'):
+                        self.urls.add(self.base + val)
+                    elif val.startswith('http'):
+                        if 'sitemap' in line.lower():
+                            self._parse_sitemap(val)
+                        else:
+                            self.urls.add(val)
+
+    # ── Sitemap parser ────────────────────────────────────────────
+    def _parse_sitemap(self, sitemap_url, depth=2):
+        if depth == 0:
+            return
+        r = safe_get(sitemap_url, timeout=10)
+        if not r or r.status_code != 200:
+            return
+        # Extract <loc> tags
+        locs = re.findall(r'<loc>\s*(https?://[^<\s]+)\s*</loc>', r.text)
+        for loc in locs:
+            if self.domain in loc:
+                self.urls.add(loc)
+            elif 'sitemap' in loc.lower():
+                self._parse_sitemap(loc, depth - 1)
 
 # ══════════════════════════════════════════════════════════════
 # 7. JS FILE ANALYSIS
